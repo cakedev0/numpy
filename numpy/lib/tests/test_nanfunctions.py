@@ -1108,19 +1108,37 @@ class TestNanFunctions_Median:
 
 class TestNanFunctions_Percentile:
 
+    @staticmethod
+    def _get_w_args(mat, weighted, axis):
+        if weighted is False:
+            return {}
+        if weighted == "1d" and not isinstance(axis, int):
+            return {}
+        w_args = {"method": "inverted_cdf"}
+        if weighted == "1d":
+            w_args["weights"] = np.ones(mat.shape[axis])
+        else:
+            w_args["weights"] = np.ones_like(mat)
+        return w_args
+
     def test_mutation(self):
         # Check that passed array is not modified.
         ndat = _ndat.copy()
         np.nanpercentile(ndat, 30)
         assert_equal(ndat, _ndat)
 
-    def test_keepdims(self):
-        mat = np.eye(3)
+    @pytest.mark.parametrize("weighted", [False, "1d", "2d"])
+    def test_keepdims(self, weighted):
+        mat = np.arange(20).reshape((4, 5))
         for axis in [None, 0, 1]:
-            tgt = np.percentile(mat, 70, axis=axis, out=None,
-                                overwrite_input=False)
-            res = np.nanpercentile(mat, 70, axis=axis, out=None,
-                                   overwrite_input=False)
+            tgt = np.percentile(
+                mat, 70, axis=axis, out=None, overwrite_input=False,
+                **self._get_w_args(mat, weighted, axis)
+            )
+            res = np.nanpercentile(
+                mat, 70, axis=axis, out=None, overwrite_input=False,
+                **self._get_w_args(mat, weighted, axis)
+            )
             assert_(res.ndim == tgt.ndim)
 
         d = np.ones((3, 5, 7, 11))
@@ -1174,33 +1192,32 @@ class TestNanFunctions_Percentile:
         assert result is out
         assert_equal(result.shape, shape_out)
 
-    @pytest.mark.parametrize("weighted", [False, True])
+    @pytest.mark.parametrize("weighted", [False, "1d", "2d"])
     def test_out(self, weighted):
         mat = np.random.rand(3, 3)
         nan_mat = np.insert(mat, [0, 2], np.nan, axis=1)
         resout = np.zeros(3)
-        if weighted:
-            w_args = {"weights": np.ones_like(mat), "method": "inverted_cdf"}
-            nan_w_args = {
-                "weights": np.ones_like(nan_mat), "method": "inverted_cdf"
-            }
-        else:
-            w_args = {}
-            nan_w_args = {}
-        tgt = np.percentile(mat, 42, axis=1, **w_args)
-        res = np.nanpercentile(nan_mat, 42, axis=1, out=resout, **nan_w_args)
+        tgt = np.percentile(mat, 42, axis=1,
+                            **self._get_w_args(mat, weighted, axis=1))
+        res = np.nanpercentile(nan_mat, 42, axis=1, out=resout,
+                               **self._get_w_args(nan_mat, weighted, axis=1))
         assert_almost_equal(res, resout)
         assert_almost_equal(res, tgt)
         # 0-d output:
         resout = np.zeros(())
-        tgt = np.percentile(mat, 42, axis=None, **w_args)
+        tgt = np.percentile(mat, 42, axis=None,
+                            **self._get_w_args(mat, weighted, axis=None))
         res = np.nanpercentile(
-            nan_mat, 42, axis=None, out=resout, **nan_w_args
+            nan_mat, 42, axis=None, out=resout,
+            **self._get_w_args(nan_mat, weighted, axis=None)
         )
         assert_almost_equal(res, resout)
         assert_almost_equal(res, tgt)
+        tgt = np.percentile(mat, 42, axis=(0, 1),
+                            **self._get_w_args(mat, weighted, axis=(0, 1)))
         res = np.nanpercentile(
-            nan_mat, 42, axis=(0, 1), out=resout, **nan_w_args
+            nan_mat, 42, axis=(0, 1), out=resout,
+            **self._get_w_args(nan_mat, weighted, axis=(0, 1))
         )
         assert_almost_equal(res, resout)
         assert_almost_equal(res, tgt)
@@ -1369,6 +1386,59 @@ class TestNanFunctions_Percentile:
 
         assert res is out
         assert_equal(out, p_expected)
+
+    @pytest.mark.parametrize("axis", [0, 1])
+    def test_1d_weights_with_nans(self, axis):
+        # gh-29709: 1-D weights raised an IndexError
+        rng = np.random.default_rng(0)
+        x = rng.random((5, 4))
+        x[1, 2] = x[3, 0] = np.nan
+        w = rng.random(x.shape[axis])
+        q = [100 / 3, 200 / 3]
+        w_full = np.broadcast_to(w if axis == 1 else w[:, None], x.shape)
+        expected = np.nanpercentile(
+            x, q, axis=axis, weights=w_full, method="inverted_cdf")
+        res = np.nanpercentile(
+            x, q, axis=axis, weights=w, method="inverted_cdf")
+        assert_equal(res, expected)
+        # each slice matches the quantile of its non-NaN values
+        for i, xi in enumerate(np.moveaxis(x, axis, -1)):
+            keep = ~np.isnan(xi)
+            assert_equal(res[:, i], np.percentile(
+                xi[keep], q, weights=w[keep], method="inverted_cdf"))
+
+    @pytest.mark.parametrize("x, w", [
+        ([1., 2.], [0., 0.]),
+        ([1., np.nan], [0., 1.]),
+        ([np.nan, np.nan], [1., 1.]),
+    ])
+    def test_weights_all_nan_or_zero(self, x, w):
+        # no value is left: NaN and a warning, as for an all-NaN slice
+        with pytest.warns(RuntimeWarning, match="all NaN or 0-weight"):
+            res = np.nanpercentile(x, 50, weights=w, method="inverted_cdf")
+        assert np.isnan(res)
+
+    def test_weights_all_nan_or_zero_ndim(self):
+        x = np.array([[1., 2., 3.], [4., np.nan, 6.], [np.nan, np.nan, 9.]])
+        w = np.array([[0., 0., 0.], [1., 1., 0.], [1., 1., 1.]])
+        with pytest.warns(RuntimeWarning, match="all NaN or 0-weight"):
+            res = np.nanpercentile(
+                x, 50, axis=1, weights=w, method="inverted_cdf")
+        assert_equal(res, [np.nan, 4., 9.])
+        # the inputs are not modified
+        assert_equal(x[0], [1., 2., 3.])
+        assert_equal(w[0], [0., 0., 0.])
+
+    def test_weights_all_nat_or_zero(self):
+        x = np.array(["2020-01-01", "NaT", "2020-01-03"], dtype="M8[D]")
+        res = np.nanpercentile(
+            x, 50, weights=[1, 5, 0], method="inverted_cdf")
+        assert_equal(res, x[0])
+        with pytest.warns(RuntimeWarning, match="all NaN or 0-weight"):
+            res = np.nanpercentile(
+                x, 50, weights=[0, 5, 0], method="inverted_cdf")
+        assert res.dtype == x.dtype
+        assert np.isnat(res)
 
 
 class TestNanFunctions_Quantile:
