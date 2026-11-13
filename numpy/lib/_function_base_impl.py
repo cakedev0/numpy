@@ -4528,7 +4528,8 @@ def _quantile_unchecked(a,
                         method="linear",
                         keepdims=False,
                         weights=None,
-                        weak_q=False):
+                        weak_q=False,
+                        ignore_nans=False):
     """Assumes that q is in [0, 1], and is an ndarray"""
     return _ureduce(a,
                     func=_quantile_ureduce_func,
@@ -4539,7 +4540,8 @@ def _quantile_unchecked(a,
                     out=out,
                     overwrite_input=overwrite_input,
                     method=method,
-                    weak_q=weak_q)
+                    weak_q=weak_q,
+                    ignore_nans=ignore_nans)
 
 
 def _quantile_is_valid(q):
@@ -4672,6 +4674,7 @@ def _quantile_ureduce_func(
     overwrite_input: bool = False,
     method: str = "linear",
     weak_q: bool = False,
+    ignore_nans: bool = False,
 ) -> np.ndarray:
     if q.ndim > 2:
         # The code below works fine for nd, but it might not have useful
@@ -4699,7 +4702,8 @@ def _quantile_ureduce_func(
                        method=method,
                        out=out,
                        weights=wgt,
-                       weak_q=weak_q)
+                       weak_q=weak_q,
+                       ignore_nans=ignore_nans)
     return result
 
 
@@ -4746,6 +4750,7 @@ def _quantile(
     out: np.ndarray | None = None,
     weights: "np.typing.ArrayLike | None" = None,
     weak_q: bool = False,
+    ignore_nans: bool = False,
 ) -> np.ndarray:
     """
     Private function that doesn't support extended axis or keepdims.
@@ -4766,7 +4771,7 @@ def _quantile(
     # axis being sampled from `arr` to be last.
     if axis != 0:  # But moveaxis is slow, so only call it if necessary.
         arr = np.moveaxis(arr, axis, destination=0)
-    supports_nans = (
+    supports_nans = (not ignore_nans) and (
         np.issubdtype(arr.dtype, np.inexact) or arr.dtype.kind in 'Mm'
     )
 
