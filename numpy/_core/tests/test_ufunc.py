@@ -2459,6 +2459,53 @@ class TestUfunc:
                 ufunc.at(a, index, b)
             assert_array_equal(a, expected)
 
+    @pytest.mark.parametrize("a_dtype,b_dtype", [
+        ("f8", "f4"), ("f4", "f8"), ("f8", "i4"), ("c16", "f8"), (">f8", "f8"),
+        ("f8", ">f8"), (">i4", "i2"), ("O", "f8"), ("unaligned", "f8"),
+    ])
+    @pytest.mark.parametrize("ufunc", [np.add, np.maximum, np.negative])
+    @pytest.mark.parametrize("axis", [0, 1])
+    @pytest.mark.parametrize("view", ["contiguous", "reversed", "transposed"])
+    # 10_000 is larger than the buffer of the casting iterator
+    @pytest.mark.parametrize("n", [7, 10_000])
+    def test_ufunc_at_subarrays_cast(self, a_dtype, b_dtype, ufunc, axis,
+                                     view, n):
+        # like test_ufunc_at_subarrays, when an operand must be cast, has a
+        # non-native byte order or is not aligned
+        rng = np.random.default_rng(0)
+        views = {
+            "contiguous": lambda x: x,
+            "reversed": lambda x: x[::-1, ::-1],
+            "transposed": lambda x: x.T,
+        }
+        shape = (5, n) if (axis == 0) == (view != "transposed") else (n, 5)
+        values = rng.integers(-50, 50, shape)
+        if a_dtype == "unaligned":
+            base = np.zeros(shape, dtype=[("pad", "u1"), ("x", "f8")])["x"]
+            assert not base.flags.aligned
+            base[...] = values
+        else:
+            base = values.astype(a_dtype)
+        a = views[view](base)
+        idx = np.array([3, 0, 3, -1, 2, 3])
+        b = rng.integers(-50, 50, (len(idx), n)).astype(b_dtype)
+        if axis == 1:
+            b = b.T
+        expected = a.copy()
+        for i, j in enumerate(idx):
+            sel = (j,) if axis == 0 else (slice(None), j)
+            if ufunc is np.negative:
+                expected[sel] = ufunc(expected[sel])
+            else:
+                expected[sel] = ufunc(expected[sel],
+                                      b[i] if axis == 0 else b[:, i])
+        index = idx if axis == 0 else (slice(None), idx)
+        if ufunc is np.negative:
+            ufunc.at(a, index)
+        else:
+            ufunc.at(a, index, b)
+        assert_array_equal(a, expected)
+
     def test_ufunc_at_0D(self):
         a = np.array(0)
         np.add.at(a, (), 1)
