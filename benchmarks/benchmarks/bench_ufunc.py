@@ -98,12 +98,16 @@ class At(Benchmark):
         self.rows = rng.random((16384, 200), dtype=np.float32)
         self.labels = rng.integers(256, size=16384).astype(np.intp)
         self.row_sums = np.zeros((256, 200), dtype=np.float32)
+        self.row_sums64 = np.zeros((256, 200), dtype=np.float64)
 
     def time_sum_at(self):
         np.add.at(self.res, self.idx, self.vals)
 
     def time_sum_at_rows(self):
         np.add.at(self.row_sums, self.labels, self.rows)
+
+    def time_sum_at_rows_cast(self):
+        np.add.at(self.row_sums64, self.labels, self.rows)
 
     def time_maximum_at(self):
         np.maximum.at(self.res, self.idx, self.vals)

@@ -6311,12 +6311,14 @@ ufunc_reduceat(PyUFuncObject *ufunc,
 
 /* Helper for ufunc_at, below */
 static inline PyArrayObject *
-new_array_op(PyArrayObject *op_array, char *data)
+new_array_op(PyArrayObject *op_array, char *data, npy_intp size,
+             npy_intp stride)
 {
-    npy_intp dims[1] = {1};
+    npy_intp dims[1] = {size};
+    npy_intp strides[1] = {stride};
     Py_INCREF(PyArray_DESCR(op_array));  /* NewFromDescr steals a reference */
     PyObject *r = PyArray_NewFromDescr(&PyArray_Type, PyArray_DESCR(op_array),
-                                       1, dims, NULL, data,
+                                       1, dims, strides, data,
                                        NPY_ARRAY_WRITEABLE, NULL);
     return (PyArrayObject *)r;
 }
@@ -6550,7 +6552,7 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
                     PyArray_Descr *operation_descrs[3],
                     PyArrayMethod_StridedLoop *strided_loop,
                     PyArrayMethod_Context *context,
-                    NpyAuxData *auxdata
+                    NpyAuxData *auxdata, npy_intp run
                     )
 {
     NpyIter *iter_buffer = NULL;
@@ -6566,16 +6568,40 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
     if (_get_bufsize_errmask(&buffersize, &errormask) < 0) {
         return -1;
     }
-    array_operands[0] = new_array_op(op1_array, iter->dataptr);
+    /*
+     * The operands are 1-D arrays of `run` elements: a single element, or a
+     * run of the last dimension when the indices select subarrays (see
+     * ufunc_at__subspace_iter).
+     */
+    npy_intp op1_stride = 0, op2_stride = 0;
+    if (run > 1) {
+        op1_stride = iter->subspace_strides[0];
+        if (iter2 != NULL) {
+            op2_stride = iter2->strides[iter->nd - 1];
+        }
+    }
+    array_operands[0] = new_array_op(
+            op1_array, iter->dataptr, run, op1_stride);
     if (iter2 != NULL) {
-        array_operands[1] = new_array_op(op2_array, PyArray_ITER_DATA(iter2));
-        array_operands[2] = new_array_op(op1_array, iter->dataptr);
+        array_operands[1] = new_array_op(
+                op2_array, PyArray_ITER_DATA(iter2), run, op2_stride);
+        array_operands[2] = new_array_op(
+                op1_array, iter->dataptr, run, op1_stride);
         nop = 3;
     }
     else {
-        array_operands[1] = new_array_op(op1_array, iter->dataptr);
+        array_operands[1] = new_array_op(
+                op1_array, iter->dataptr, run, op1_stride);
         array_operands[2] = NULL;
         nop = 2;
+    }
+    for (int i = 0; i < nop; i++) {
+        if (array_operands[i] == NULL) {
+            for (int j = 0; j < nop; j++) {
+                Py_XDECREF(array_operands[j]);
+            }
+            return -1;
+        }
     }
     /* Set up the flags */
     npy_uint32 op_flags[3];
@@ -6599,14 +6625,14 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
                       NPY_ITER_NO_SUBTYPE;
     }
     /*
-     * Create NpyIter object to "iterate" over single element of each input
-     * operand. This is an easy way to reuse the NpyIter logic for dealing
-     * with certain cases like casting operands to correct dtype. On each
-     * iteration over the MapIterArray object created above, we'll take the
-     * current data pointers from that and reset this NpyIter object using
-     * those data pointers, and then trigger a buffer copy. The buffer data
-     * pointers from the NpyIter object will then be passed to the inner loop
-     * function.
+     * Create NpyIter object to "iterate" over a single element (or a single
+     * run) of each input operand. This is an easy way to reuse the NpyIter
+     * logic for dealing with certain cases like casting operands to correct
+     * dtype. On each iteration over the MapIterArray object created above,
+     * we'll take the current data pointers from that and reset this NpyIter
+     * object using those data pointers, and then trigger a buffer copy. The
+     * buffer data pointers from the NpyIter object will then be passed to the
+     * inner loop function.
      */
     iter_buffer = NpyIter_AdvancedNew(nop, array_operands,
                         NPY_ITER_EXTERNAL_LOOP|
@@ -6615,7 +6641,7 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
                         NPY_ITER_BUFFERED|
                         NPY_ITER_GROWINNER|
                         NPY_ITER_DELAY_BUFALLOC,
-                        NPY_KEEPORDER, NPY_UNSAFE_CASTING,
+                        NPY_CORDER, NPY_UNSAFE_CASTING,
                         op_flags, operation_descrs,
                         -1, NULL, NULL, buffersize);
 
@@ -6638,26 +6664,52 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
     }
     flags = PyArrayMethod_COMBINED_FLAGS(flags, NpyIter_GetTransferFlags(iter_buffer));
 
+    /*
+     * One element at a time, no stride is required but it is read by the
+     * innerloop. A run needs the strides of the iterator, and a loop that
+     * is valid for them (the caller asked for a contiguous one).
+     */
+    npy_intp zero_strides[3] = {0, 0, 0};
+    npy_intp *strides = zero_strides;
+    npy_intp *countptr = NULL;
+    NpyAuxData *run_auxdata = NULL;
+    if (run > 1) {
+        npy_intp fixed_strides[3];
+        NPY_ARRAYMETHOD_FLAGS loop_flags;
+
+        NpyIter_GetInnerFixedStrideArray(iter_buffer, fixed_strides);
+        if (context->method->get_strided_loop(context, 1, 0, fixed_strides,
+                &strided_loop, &run_auxdata, &loop_flags) < 0) {
+            NpyIter_Deallocate(iter_buffer);
+            for (int i = 0; i < 3; i++) {
+                Py_XDECREF(array_operands[i]);
+            }
+            return -1;
+        }
+        auxdata = run_auxdata;
+        flags = PyArrayMethod_COMBINED_FLAGS(flags, loop_flags);
+        strides = NpyIter_GetInnerStrideArray(iter_buffer);
+        countptr = NpyIter_GetInnerLoopSizePtr(iter_buffer);
+    }
+
     int needs_api = (flags & NPY_METH_REQUIRES_PYAPI) != 0;
     if (!(flags & NPY_METH_NO_FLOATINGPOINT_ERRORS)) {
         /* Start with the floating-point exception flags cleared */
         npy_clear_floatstatus_barrier((char*)&iter);
     }
 
-    npy_intp strides[3] = {0, 0, 0};
     if (!needs_api) {
         NPY_BEGIN_THREADS;
     }
 
     /*
      * Iterate over first and second operands and call ufunc
-     * for each pair of inputs
+     * for each pair of inputs (or each pair of runs)
      */
-    for (npy_intp i = iter->size; i > 0; i--)
+    for (npy_intp pos = 0; pos < iter->size; pos += run)
     {
         char *dataptr[3];
         char **buffer_dataptr;
-        /* one element at a time, no stride required but read by innerloop */
         npy_intp count = 1;
 
         /*
@@ -6666,6 +6718,9 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
          */
         dataptr[0] = iter->dataptr;
         if (iter2 != NULL) {
+            if (run > 1) {
+                PyArray_ITER_GOTO1D(iter2, pos);
+            }
             dataptr[1] = PyArray_ITER_DATA(iter2);
             dataptr[2] = iter->dataptr;
         }
@@ -6683,24 +6738,35 @@ ufunc_at__slow_iter(PyUFuncObject *ufunc, NPY_ARRAYMETHOD_FLAGS flags,
 
         buffer_dataptr = NpyIter_GetDataPtrArray(iter_buffer);
 
-        res = strided_loop(context, buffer_dataptr, &count, strides, auxdata);
+        /*
+         * Call to iternext triggers copy from buffer back to output array
+         * after innerloop puts result in buffer. A run that is longer than
+         * the buffer takes several inner loops.
+         */
+        do {
+            if (countptr != NULL) {
+                count = *countptr;
+            }
+            res = strided_loop(
+                    context, buffer_dataptr, &count, strides, auxdata);
+        } while (res == 0 && iternext(iter_buffer));
         if (res != 0) {
             break;
         }
 
-        /*
-         * Call to iternext triggers copy from buffer back to output array
-         * after innerloop puts result in buffer.
-         */
-        iternext(iter_buffer);
-
+        if (run > 1) {
+            /* skip to the last element of the run, then step past it */
+            iter->iter_count -= run - 1;
+            iter->subspace_ptrs[0] += (run - 1) * op1_stride;
+        }
         PyArray_MapIterNext(iter);
-        if (iter2 != NULL) {
+        if (iter2 != NULL && run == 1) {
             PyArray_ITER_NEXT(iter2);
         }
     }
 
     NPY_END_THREADS;
+    NPY_AUXDATA_FREE(run_auxdata);
 
     if (res != 0 && err_msg) {
         PyErr_SetString(PyExc_ValueError, err_msg);
@@ -6946,6 +7012,18 @@ ufunc_at(PyUFuncObject *ufunc, PyObject *args)
             &strided_loop, &auxdata, &flags) < 0) {
         goto fail;
     }
+    /*
+     * When the indices select subarrays (some dimensions of op1 are not
+     * indexed by an array), the last iteration dimension is the last
+     * dimension of these subarrays, and the inner loop can be called once
+     * per run along it. With runs of length 1 this would gain nothing over
+     * the per-element paths.
+     */
+    npy_intp run = 1;
+    if ((iter->subspace_iter != NULL) && (iter->nd > 0) &&
+            (iter->dimensions[iter->nd - 1] > 1)) {
+        run = iter->dimensions[iter->nd - 1];
+    }
     int fast_path = 1;
     /* check no casting, alignment */
     if (PyArray_DESCR(op1_array) != operation_descrs[0]) {
@@ -6983,15 +7061,7 @@ ufunc_at(PyUFuncObject *ufunc, PyObject *args)
                         op2_array, &context);
 
         }
-        /*
-         * The indices select subarrays (some dimensions of op1 are not
-         * indexed by an array). The last iteration dimension is then the
-         * last dimension of these subarrays, and the inner loop can be
-         * called once per run along it. With runs of length 1 this would
-         * gain nothing over the per-element path below.
-         */
-        else if ((iter->subspace_iter != NULL) && (iter->nd > 0) &&
-                 (iter->dimensions[iter->nd - 1] > 1)) {
+        else if (run > 1) {
             res = ufunc_at__subspace_iter(ufuncimpl, flags, iter, iter2,
                                           &context);
         }
@@ -7003,7 +7073,7 @@ ufunc_at(PyUFuncObject *ufunc, PyObject *args)
     } else {
         res = ufunc_at__slow_iter(ufunc, flags, iter, iter2, op1_array,
                         op2_array, operation_descrs, strided_loop, &context,
-                        auxdata);
+                        auxdata, run);
     }
 
 fail:
